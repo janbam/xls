@@ -1,0 +1,13 @@
+{
+  "name": "xls",
+  "version": "0.1.0",
+  "description": "Standalone directory tree inspection CLI.",
+  "type": "module",
+  "bin": {
+    "xls": "./bin/xls.js"
+  },
+  "scripts": {
+    "check": "node --check bin/xls.js"
+  },
+  "license": "UNLICENSED"
+}
