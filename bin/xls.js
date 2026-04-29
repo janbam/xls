@@ -368,6 +368,63 @@ export function createFileTree(resultObjects) {
 }
 
 /**
+ * Build the display components for a single tree node (name, size, symlink, date).
+ *
+ * Extracted so both the root entry and descendant entries share the same label,
+ * metadata, and permission-flag formatting.
+ *
+ * @param {object} node Tree node.
+ * @param {object} options Rendering controls.
+ * @returns {{displayName: string, fileSizeInfo: string, symlinkInfo: string, modificationDateInfo: string}}
+ */
+function renderNodeDisplay(node, options) {
+  let displayName = node.name;
+
+  // Directory suffix, skipped marker, error marker, executable file decoration.
+  if (node.type === 'directory') {
+    displayName += sep;
+  }
+
+  if (node.isSkipped) {
+    displayName += ' [SKIPPED]';
+  } else if (node.isError && node.errorMessage) {
+    displayName += ` [ERROR: ${node.errorMessage}]`;
+  } else if (node.type === 'file' && node.isExecutable) {
+    displayName = `*${displayName}*`;
+  }
+
+  // Compact file metadata attached only when the entry was actually inspected.
+  let fileSizeInfo = '';
+  if (!node.isSkipped && !node.isError && node.type === 'file' && node.fileSize !== null) {
+    const sizeStr = formatFileSize(node.fileSize);
+    fileSizeInfo = node.lineCount !== null
+      ? `\t(${sizeStr} / ${node.lineCount} lines)`
+      : `\t(${sizeStr})`;
+  }
+
+  // Raw symlink target so users see the link exactly as stored.
+  let symlinkInfo = '';
+  if (!node.isSkipped && !node.isError && node.isSymlink && node.symlinkTarget) {
+    symlinkInfo = ` -> ${node.symlinkTarget}`;
+  } else if (!node.isSkipped && !node.isError && node.isSymlink) {
+    symlinkInfo = ' -> ';
+  }
+
+  // Timestamps visually aligned for quick scanning in terminal output.
+  let modificationDateInfo = '';
+  if (!node.isSkipped && !node.isError && node.modificationTime) {
+    const formattedDate = formatModificationDate(node.modificationTime);
+    if (formattedDate) {
+      modificationDateInfo = node.type === 'directory'
+        ? `\t\t${formattedDate}`
+        : `\t${formattedDate}`;
+    }
+  }
+
+  return { displayName, fileSizeInfo, symlinkInfo, modificationDateInfo };
+}
+
+/**
  * Render a directory tree using box-drawing characters and per-node metadata.
  * @param {object[]} tree Tree nodes from createFileTree.
  * @param {number} level Current recursion depth.
@@ -386,57 +443,39 @@ export function printTree(tree, level = 0, prefix = '', rootPath = '', options =
       result += `Modification dates shown in [YYYY/MM/DD - HH:MM:SS] format (${timeZone} timezone)\n`;
     }
     result += '\n';
+
+    // Build a root node so it flows through the same render path as every other entry,
+    // picking up modification dates and consistent formatting.
+    const rootName = rootPath === sep ? sep : basename(rootPath);
+    let rootModTime = null;
+    if (options.showDates) {
+      try { rootModTime = statSync(rootPath).mtime; } catch { /* root stat failure is non-fatal */ }
+    }
+    const rootNode = {
+      name: rootName,
+      type: 'directory',
+      isSymlink: false,
+      symlinkTarget: null,
+      isExecutable: false,
+      isSkipped: false,
+      isError: false,
+      errorMessage: null,
+      fileSize: null,
+      lineCount: null,
+      modificationTime: rootModTime,
+    };
+    const rd = renderNodeDisplay(rootNode, options);
+    result += `${rd.displayName}${rd.fileSizeInfo}${rd.symlinkInfo}${rd.modificationDateInfo}\n`;
+
     prefix = '';
   }
 
   for (let i = 0; i < tree.length; i++) {
     const node = tree[i];
     const isLast = i === tree.length - 1;
-    let displayName = node.name;
-
-    // Build the visible node label from structural and permission metadata.
-    if (node.type === 'directory') {
-      displayName += sep;
-    }
-
-    if (node.isSkipped) {
-      displayName += ' [SKIPPED]';
-    } else if (node.isError && node.errorMessage) {
-      displayName += ` [ERROR: ${node.errorMessage}]`;
-    } else if (node.type === 'file' && node.isExecutable) {
-      displayName = `*${displayName}*`;
-    }
-
-    // Attach compact file metadata only when the entry was actually inspected.
-    let fileSizeInfo = '';
-    if (!node.isSkipped && !node.isError && node.type === 'file' && node.fileSize !== null) {
-      const sizeStr = formatFileSize(node.fileSize);
-      fileSizeInfo = node.lineCount !== null
-        ? `\t(${sizeStr} / ${node.lineCount} lines)`
-        : `\t(${sizeStr})`;
-    }
-
-    // Preserve raw symlink targets so users see the link exactly as stored.
-    let symlinkInfo = '';
-    if (!node.isSkipped && !node.isError && node.isSymlink && node.symlinkTarget) {
-      symlinkInfo = ` -> ${node.symlinkTarget}`;
-    } else if (!node.isSkipped && !node.isError && node.isSymlink) {
-      symlinkInfo = ' -> ';
-    }
-
-    // Keep timestamps visually aligned for quick scanning in terminal output.
-    let modificationDateInfo = '';
-    if (!node.isSkipped && !node.isError && node.modificationTime) {
-      const formattedDate = formatModificationDate(node.modificationTime);
-      if (formattedDate) {
-        modificationDateInfo = node.type === 'directory'
-          ? `\t\t${formattedDate}`
-          : `\t${formattedDate}`;
-      }
-    }
-
+    const rd = renderNodeDisplay(node, options);
     const treeSymbol = isLast ? '└── ' : '├── ';
-    result += `${prefix}${treeSymbol}${displayName}${fileSizeInfo}${symlinkInfo}${modificationDateInfo}\n`;
+    result += `${prefix}${treeSymbol}${rd.displayName}${rd.fileSizeInfo}${rd.symlinkInfo}${rd.modificationDateInfo}\n`;
 
     // Recurse only into nodes that were traversed successfully.
     if (!node.isSkipped && !node.isError && node.children?.length > 0) {
