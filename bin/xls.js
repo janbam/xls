@@ -1184,6 +1184,27 @@ function depthFromBase(basePath, childPath) {
   return relative(basePath, childPath).split(sep).filter((part) => part !== '').length;
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+/**
+ * Decide whether this module is the active CLI entrypoint.
+ * @param {string|undefined} invokedPath Path Node received as the script argument.
+ * @param {string} moduleUrl URL of the current ES module.
+ * @returns {boolean} True when the current module should run the standalone CLI.
+ */
+function isCliEntrypoint(invokedPath, moduleUrl) {
+  if (!invokedPath) {
+    return false;
+  }
+
+  const modulePath = fileURLToPath(moduleUrl);
+
+  try {
+    // Compare canonical paths so symlinked bin entries still execute the CLI.
+    return realpathSync(invokedPath) === realpathSync(modulePath);
+  } catch {
+    return invokedPath === modulePath;
+  }
+}
+
+if (isCliEntrypoint(process.argv[1], import.meta.url)) {
   process.exitCode = runCli(process.argv.slice(2));
 }
