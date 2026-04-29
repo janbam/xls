@@ -137,6 +137,7 @@ export function shouldShowAsSkipped(path, all = false) {
 
   return pathName === 'node_modules'
     || pathName === '.git'
+    || pathName.endsWith('.git')
     || pathName === 'dist'
     || pathName === 'build'
     || pathName === '.next'
@@ -150,6 +151,7 @@ export function shouldShowAsSkipped(path, all = false) {
     || pathName === '.cache'
     || pathName === '.pytest_cache'
     || pathName === '.mypy_cache'
+    || pathName === '__pycache__'
     || pathName === '.tox'
     || pathName === 'htmlcov'
     || pathName === 'target'
@@ -173,7 +175,7 @@ export function skip(path, all = false) {
     return false;
   }
 
-  return path.includes(`__pycache__${sep}`);
+  return false;
 }
 
 /**
@@ -182,7 +184,7 @@ export function skip(path, all = false) {
  * @param {string} basePath Directory used to produce relative result paths.
  * @param {object} options Listing policy and output controls.
  * @param {AbortSignal | undefined} abortSignal Optional signal for embedding callers.
- * @returns {{results: object[], fullStats: object, truncated: boolean, crawlHitLimit: boolean}} Listing data and aggregate crawl metadata.
+ * @returns {{results: object[], fullStats: object, truncated: boolean, crawlHitLimit: boolean, depthLimitHit: boolean}} Listing data and aggregate crawl metadata.
  */
 export function listDirectory(initialPath, basePath, options = DEFAULT_OPTIONS, abortSignal) {
   const results = [];
@@ -196,21 +198,25 @@ export function listDirectory(initialPath, basePath, options = DEFAULT_OPTIONS, 
   };
   let truncated = false;
   let crawlHitLimit = false;
+  let depthLimitHit = Number.isFinite(options.maxDepth) && options.maxDepth === 0;
 
   // A depth of zero means "show this root only"; roots are headers, not result entries.
   if (options.maxDepth === 0) {
-    return { results, fullStats, truncated, crawlHitLimit };
+    return { results, fullStats, truncated, crawlHitLimit, depthLimitHit };
   }
 
   const queue = [initialPath];
   while (queue.length > 0) {
     if (abortSignal?.aborted) {
-      return { results, fullStats, truncated, crawlHitLimit };
+      return { results, fullStats, truncated, crawlHitLimit, depthLimitHit };
     }
 
     // Keep pathological trees bounded so the CLI remains responsive.
     if (fullStats.totalItems >= options.maxCrawl) {
       crawlHitLimit = true;
+      for (const queuedPath of queue) {
+        markDisplayedDirectoryAsSkipped(results, basePath, queuedPath);
+      }
       break;
     }
 
@@ -243,6 +249,7 @@ export function listDirectory(initialPath, basePath, options = DEFAULT_OPTIONS, 
     for (const child of children) {
       if (fullStats.totalItems >= options.maxCrawl) {
         crawlHitLimit = true;
+        markDisplayedDirectoryAsSkipped(results, basePath, path);
         break;
       }
 
@@ -266,6 +273,9 @@ export function listDirectory(initialPath, basePath, options = DEFAULT_OPTIONS, 
         recordDirectory(results, fullStats, basePath, childPath, options, childDepth, canShowChild, () => {
           truncated = true;
         });
+        if (childDepth >= options.maxDepth) {
+          depthLimitHit = true;
+        }
         if (childDepth < options.maxDepth) {
           queue.push(childPath);
         }
@@ -283,7 +293,7 @@ export function listDirectory(initialPath, basePath, options = DEFAULT_OPTIONS, 
     }
   }
 
-  return { results, fullStats, truncated, crawlHitLimit };
+  return { results, fullStats, truncated, crawlHitLimit, depthLimitHit };
 }
 
 /**
@@ -608,24 +618,31 @@ export function inspectDirectory({ path, abortSignal, ...rawOptions } = {}) {
   if (listResult.truncated) {
     const rootLevelItems = result.filter((item) => item.depth === 1);
     isRootLevelTruncation = rootLevelItems.length === options.maxItems;
+    if (!isRootLevelTruncation) {
+      for (const item of rootLevelItems) {
+        if (item.isDirectory) {
+          item.isSkipped = true;
+        }
+      }
+    }
     result = rootLevelItems;
   }
 
   const displayedStats = calculateStatistics(result);
   const tree = printTree(createFileTree(result), 0, '', fullFilePath, options);
-  const crawlLimitNote = listResult.crawlHitLimit ? ` (crawl stopped at ${options.maxCrawl} items)` : '';
   let statsMessage;
 
   if (listResult.truncated) {
     const foundStats = listResult.fullStats;
     statsMessage = `\nCrawled: ${foundStats.totalItems} total items (${foundStats.fileCount} files, ${foundStats.dirCount} directories, ${foundStats.errorCount} errors, ${foundStats.skippedCount} skipped) | Max depth: ${foundStats.maxDepth}\nDisplayed: ${displayedStats.totalItems} total items (${displayedStats.fileCount} files, ${displayedStats.dirCount} directories, ${displayedStats.errorCount} errors, ${displayedStats.skippedCount} skipped) | Max depth: ${displayedStats.maxDepth}`;
   } else {
-    statsMessage = `\nStatistics: ${displayedStats.totalItems} total items (${displayedStats.fileCount} files, ${displayedStats.dirCount} directories, ${displayedStats.errorCount} errors, ${displayedStats.skippedCount} skipped) | Max depth: ${displayedStats.maxDepth} | Accessible: ${displayedStats.accessibleItems}${crawlLimitNote}`;
+    statsMessage = `\nStatistics: ${displayedStats.totalItems} total items (${displayedStats.fileCount} files, ${displayedStats.dirCount} directories, ${displayedStats.errorCount} errors, ${displayedStats.skippedCount} skipped) | Max depth: ${displayedStats.maxDepth} | Accessible: ${displayedStats.accessibleItems}`;
   }
 
+  const limitWarning = getLimitWarning(listResult, isRootLevelTruncation, options);
   const rendered = listResult.truncated
-    ? `${getTruncatedMessage(isRootLevelTruncation, options.maxItems)}${tree}${isRootLevelTruncation ? '[TRUNCATED!]\n' : ''}${statsMessage}`
-    : tree + statsMessage;
+    ? `${getTruncatedMessage(isRootLevelTruncation, options.maxItems)}${tree}${isRootLevelTruncation ? '[TRUNCATED!]\n' : ''}${statsMessage}${limitWarning}`
+    : tree + statsMessage + limitWarning;
   const outputResult = options.absolute
     ? result.map((entry) => absolutizeResultPath(entry, fullFilePath))
     : result;
@@ -912,6 +929,38 @@ function getTruncatedMessage(isRootLevelTruncation, maxItems) {
 }
 
 /**
+ * Build the final high-visibility warning for any output limit that hid entries.
+ * @param {{truncated: boolean, crawlHitLimit: boolean, depthLimitHit: boolean}} listResult Listing limit state.
+ * @param {boolean} isRootLevelTruncation Whether root entries alone exceeded the display limit.
+ * @param {object} options Complete listing policy.
+ * @returns {string} Bottom-of-output warning text, or an empty string when no limit was hit.
+ */
+function getLimitWarning(listResult, isRootLevelTruncation, options) {
+  const warnings = [];
+
+  if (listResult.truncated) {
+    const scope = isRootLevelTruncation
+      ? `ROOT-LEVEL ENTRIES WERE OMITTED AFTER THE FIRST ${options.maxItems} DISPLAYED ITEMS`
+      : `SOME DESCENDANTS WERE OMITTED AFTER THE FIRST ${options.maxItems} DISPLAYED ITEMS`;
+    warnings.push(scope);
+  }
+
+  if (listResult.crawlHitLimit) {
+    warnings.push(`CRAWL STOPPED AT ${options.maxCrawl} EXAMINED ITEMS`);
+  }
+
+  if (listResult.depthLimitHit) {
+    warnings.push(`DEPTH LIMIT ${options.maxDepth} PREVENTED DESCENDANT TRAVERSAL`);
+  }
+
+  if (warnings.length === 0) {
+    return '';
+  }
+
+  return `\n🚨 ${warnings.join('; ')}. EXISTING FILES OR DIRECTORIES MAY NOT BE SHOWN. 🚨`;
+}
+
+/**
  * Return a result entry whose path is absolute for structured output.
  * @param {object} entry Relative result entry.
  * @param {string} rootPath Absolute listed root.
@@ -979,7 +1028,7 @@ function recordDirectory(results, fullStats, basePath, childPath, options, pathD
     symlinkTarget: null,
     isDirectory: true,
     isExecutable: false,
-    isSkipped: false,
+    isSkipped: pathDepth >= options.maxDepth,
     depth: pathDepth,
     fileSize: null,
     lineCount: null,
@@ -1171,7 +1220,47 @@ function pushResult(results, entry, options, onTruncated) {
     return;
   }
 
+  // Preserve the honesty invariant: if a descendant disappears, mark its visible parent.
+  markVisibleAncestorAsSkipped(results, entry.path);
   onTruncated();
+}
+
+/**
+ * Mark the nearest displayed directory ancestor as skipped after a descendant is omitted.
+ * @param {object[]} results Mutable result list.
+ * @param {string} omittedPath Relative path that could not be displayed.
+ */
+function markVisibleAncestorAsSkipped(results, omittedPath) {
+  const normalizedPath = omittedPath.endsWith(sep) ? omittedPath.slice(0, -1) : omittedPath;
+  const parts = normalizedPath.split(sep).filter((part) => part !== '');
+
+  for (let i = parts.length - 1; i > 0; i--) {
+    const ancestorPath = `${parts.slice(0, i).join(sep)}${sep}`;
+    const ancestor = results.find((entry) => entry.path === ancestorPath && entry.isDirectory);
+    if (ancestor) {
+      ancestor.isSkipped = true;
+      return;
+    }
+  }
+}
+
+/**
+ * Mark a displayed directory as skipped when traversal stops before it can be explored.
+ * @param {object[]} results Mutable result list.
+ * @param {string} basePath Root path used for relative display paths.
+ * @param {string} directoryPath Directory whose descendants were omitted.
+ */
+function markDisplayedDirectoryAsSkipped(results, basePath, directoryPath) {
+  const relativePath = relative(basePath, directoryPath);
+  if (!relativePath) {
+    return;
+  }
+
+  const entryPath = `${relativePath}${sep}`;
+  const entry = results.find((result) => result.path === entryPath && result.isDirectory);
+  if (entry) {
+    entry.isSkipped = true;
+  }
 }
 
 /**
