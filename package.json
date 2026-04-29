@@ -9,5 +9,5 @@
   "scripts": {
     "check": "node --check bin/xls.js"
   },
-  "license": "UNLICENSED"
+  "license": "MIT"
 }

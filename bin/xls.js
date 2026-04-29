@@ -11,19 +11,38 @@ import { basename, join, relative, sep, resolve, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
-const MAX_FILES = 500;
-const MAX_FILES_CRAWL = 1000;
-const TRUNCATED_MESSAGE = `This directory contains more than ${MAX_FILES} entries when explored recursively. ALL root-level entries are shown below, but subdirectories are not fully explored. Use xls on specific subdirectories to see their complete contents.\n\n`;
-const ROOT_TRUNCATED_MESSAGE = `This directory has more than ${MAX_FILES} root-level entries, which exceeds the display limit. Showing only the first ${MAX_FILES} root-level entries below. Use xls on specific subdirectories to explore deeper content.\n\n`;
+const DEFAULT_MAX_ITEMS = 500;
+const DEFAULT_MAX_CRAWL = 1000;
+const DEFAULT_OPTIONS = Object.freeze({
+  all: false,
+  maxDepth: Infinity,
+  maxItems: DEFAULT_MAX_ITEMS,
+  maxCrawl: DEFAULT_MAX_CRAWL,
+  showFiles: true,
+  showDirectories: true,
+  showSizes: true,
+  showLines: true,
+  showDates: true,
+  absolute: false,
+});
 
-const HELP_TEXT = `Usage: xls [options] <path>
+const HELP_TEXT = `Usage: xls [options] <path...>
 
-Professional directory exploration tool that shows a clean recursive tree with
-file sizes, line counts for text files, symlink targets, executable markers,
-modification dates, skipped clutter, and summary statistics.
+xls prints a compact, truthful map of one or more directories: directories first,
+files after, symlinks as stored, executables marked, noisy project clutter hidden
+by default, and a short statistics line at the end.
 
 Options:
-  -a, --include-clutter   Include hidden and clutter directories such as .git and node_modules
+  -a, --all               Include hidden and clutter directories such as .git and node_modules
+      --max-depth <n>     Limit traversal to n path levels below each root
+      --max-items <n>     Limit displayed entries per root (default: 500)
+      --max-crawl <n>     Limit examined entries per root (default: 1000)
+      --dirs-only         Show directories only
+      --files-only        Show files only, with parent folders kept for context
+      --no-sizes          Hide file sizes
+      --no-lines          Skip text line counts
+      --no-dates          Hide modification dates
+      --absolute          Use absolute entry paths in JSON output
       --json              Print structured JSON instead of the rendered tree
   -h, --help              Show this help text
       --version           Show the version
@@ -102,11 +121,11 @@ export function resolvePath(path) {
 /**
  * Decide whether a path should be displayed as present but intentionally not traversed.
  * @param {string} path Absolute or relative filesystem path.
- * @param {boolean} includeClutter Whether hidden and clutter paths should be traversed normally.
+ * @param {boolean} all Whether hidden and clutter paths should be traversed normally.
  * @returns {boolean} True when the entry should be marked `[SKIPPED]`.
  */
-export function shouldShowAsSkipped(path, includeClutter = false) {
-  if (includeClutter) {
+export function shouldShowAsSkipped(path, all = false) {
+  if (all) {
     return false;
   }
 
@@ -142,15 +161,15 @@ export function shouldShowAsSkipped(path, includeClutter = false) {
 /**
  * Decide whether a path should be omitted entirely from traversal.
  * @param {string} path Absolute or relative filesystem path.
- * @param {boolean} includeClutter Whether hidden and clutter paths should be traversed normally.
+ * @param {boolean} all Whether hidden and clutter paths should be traversed normally.
  * @returns {boolean} True when the entry should be omitted.
  */
-export function skip(path, includeClutter = false) {
+export function skip(path, all = false) {
   if (path === '.') {
     return true;
   }
 
-  if (includeClutter) {
+  if (all) {
     return false;
   }
 
@@ -161,11 +180,11 @@ export function skip(path, includeClutter = false) {
  * Recursively list directory entries using breadth-first traversal with display and crawl limits.
  * @param {string} initialPath Directory to list.
  * @param {string} basePath Directory used to produce relative result paths.
- * @param {boolean} includeClutter Whether hidden and clutter paths should be included.
+ * @param {object} options Listing policy and output controls.
  * @param {AbortSignal | undefined} abortSignal Optional signal for embedding callers.
  * @returns {{results: object[], fullStats: object, truncated: boolean, crawlHitLimit: boolean}} Listing data and aggregate crawl metadata.
  */
-export function listDirectory(initialPath, basePath, includeClutter, abortSignal) {
+export function listDirectory(initialPath, basePath, options = DEFAULT_OPTIONS, abortSignal) {
   const results = [];
   const fullStats = {
     totalItems: 0,
@@ -178,6 +197,11 @@ export function listDirectory(initialPath, basePath, includeClutter, abortSignal
   let truncated = false;
   let crawlHitLimit = false;
 
+  // A depth of zero means "show this root only"; roots are headers, not result entries.
+  if (options.maxDepth === 0) {
+    return { results, fullStats, truncated, crawlHitLimit };
+  }
+
   const queue = [initialPath];
   while (queue.length > 0) {
     if (abortSignal?.aborted) {
@@ -185,17 +209,17 @@ export function listDirectory(initialPath, basePath, includeClutter, abortSignal
     }
 
     // Keep pathological trees bounded so the CLI remains responsive.
-    if (fullStats.totalItems >= MAX_FILES_CRAWL) {
+    if (fullStats.totalItems >= options.maxCrawl) {
       crawlHitLimit = true;
       break;
     }
 
     const path = queue.shift();
-    if (skip(path, includeClutter)) {
+    if (skip(path, options.all)) {
       continue;
     }
 
-    if (path !== initialPath && shouldShowAsSkipped(path, includeClutter)) {
+    if (path !== initialPath && shouldShowAsSkipped(path, options.all)) {
       continue;
     }
 
@@ -210,42 +234,46 @@ export function listDirectory(initialPath, basePath, includeClutter, abortSignal
       });
     } catch (error) {
       // Surface unreadable directories in-place instead of silently dropping them.
-      recordDirectoryError(results, fullStats, basePath, path, error, () => {
+      recordDirectoryError(results, fullStats, basePath, path, error, options, () => {
         truncated = true;
       });
       continue;
     }
 
     for (const child of children) {
-      if (fullStats.totalItems >= MAX_FILES_CRAWL) {
+      if (fullStats.totalItems >= options.maxCrawl) {
         crawlHitLimit = true;
         break;
       }
 
       const childPath = join(path, child.name);
-      if (skip(childPath, includeClutter)) {
+      if (skip(childPath, options.all)) {
         continue;
       }
+      const childDepth = depthFromBase(basePath, childPath);
+      const canShowChild = childDepth <= options.maxDepth;
 
       if (child.isDirectory()) {
         // Show noisy directories as known-but-unexplored unless the caller asks for clutter.
-        if (shouldShowAsSkipped(childPath, includeClutter)) {
-          recordSkippedDirectory(results, fullStats, basePath, childPath, () => {
+        if (shouldShowAsSkipped(childPath, options.all)) {
+          recordSkippedDirectory(results, fullStats, basePath, childPath, options, childDepth, () => {
             truncated = true;
           });
           continue;
         }
 
         // Add traversable directories immediately so the rendered tree keeps sorted sibling order.
-        recordDirectory(results, fullStats, basePath, childPath, () => {
+        recordDirectory(results, fullStats, basePath, childPath, options, childDepth, canShowChild, () => {
           truncated = true;
         });
-        queue.push(childPath);
+        if (childDepth < options.maxDepth) {
+          queue.push(childPath);
+        }
         continue;
       }
 
       // Files and symlinks carry display metadata but are never traversed here.
-      recordFile(results, fullStats, basePath, childPath, () => {
+      recordFile(results, fullStats, basePath, childPath, options, childDepth, canShowChild, () => {
         truncated = true;
       });
     }
@@ -335,14 +363,19 @@ export function createFileTree(resultObjects) {
  * @param {number} level Current recursion depth.
  * @param {string} prefix Prefix inherited from parent branches.
  * @param {string} rootPath Absolute root path shown in the heading.
+ * @param {object} options Rendering controls.
  * @returns {string} Human-readable tree output.
  */
-export function printTree(tree, level = 0, prefix = '', rootPath = '') {
+export function printTree(tree, level = 0, prefix = '', rootPath = '', options = DEFAULT_OPTIONS) {
   let result = '';
 
   if (level === 0) {
-    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-    result += `Showing contents of: ${rootPath}\nModification dates shown in [YYYY/MM/DD - HH:MM:SS] format (${timeZone} timezone)\n\n`;
+    result += `Showing contents of: ${rootPath}\n`;
+    if (options.showDates) {
+      const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      result += `Modification dates shown in [YYYY/MM/DD - HH:MM:SS] format (${timeZone} timezone)\n`;
+    }
+    result += '\n';
     prefix = '';
   }
 
@@ -398,7 +431,7 @@ export function printTree(tree, level = 0, prefix = '', rootPath = '') {
     // Recurse only into nodes that were traversed successfully.
     if (!node.isSkipped && !node.isError && node.children?.length > 0) {
       const childPrefix = prefix + (isLast ? '    ' : '│   ');
-      result += printTree(node.children, level + 1, childPrefix, rootPath);
+      result += printTree(node.children, level + 1, childPrefix, rootPath, options);
     }
   }
 
@@ -552,34 +585,35 @@ export function calculateStatistics(resultObjects) {
 
 /**
  * List a directory and prepare both structured and rendered output.
- * @param {{path: string, includeClutter?: boolean, abortSignal?: AbortSignal}} options Listing options.
+ * @param {{path: string, abortSignal?: AbortSignal} & object} options Listing options.
  * @returns {object} Complete listing payload for CLI rendering or JSON output.
  */
-export function inspectDirectory({ path, includeClutter = false, abortSignal } = {}) {
+export function inspectDirectory({ path, abortSignal, ...rawOptions } = {}) {
   if (!path) {
     throw new CliError('Missing required path argument.', 2);
   }
 
+  const options = normalizeOptions(rawOptions);
   const fullFilePath = resolvePath(path);
   const stats = statSync(fullFilePath);
   if (!stats.isDirectory()) {
     throw new CliError(`Path is not a directory: ${fullFilePath}`, 1);
   }
 
-  const listResult = listDirectory(fullFilePath, fullFilePath, includeClutter, abortSignal);
+  const listResult = listDirectory(fullFilePath, fullFilePath, options, abortSignal);
   let result = listResult.results;
 
   // When display truncates, retain all root-level entries where possible.
   let isRootLevelTruncation = false;
   if (listResult.truncated) {
     const rootLevelItems = result.filter((item) => item.depth === 1);
-    isRootLevelTruncation = rootLevelItems.length === MAX_FILES;
+    isRootLevelTruncation = rootLevelItems.length === options.maxItems;
     result = rootLevelItems;
   }
 
   const displayedStats = calculateStatistics(result);
-  const tree = printTree(createFileTree(result), 0, '', fullFilePath);
-  const crawlLimitNote = listResult.crawlHitLimit ? ` (crawl stopped at ${MAX_FILES_CRAWL} items)` : '';
+  const tree = printTree(createFileTree(result), 0, '', fullFilePath, options);
+  const crawlLimitNote = listResult.crawlHitLimit ? ` (crawl stopped at ${options.maxCrawl} items)` : '';
   let statsMessage;
 
   if (listResult.truncated) {
@@ -590,16 +624,20 @@ export function inspectDirectory({ path, includeClutter = false, abortSignal } =
   }
 
   const rendered = listResult.truncated
-    ? `${isRootLevelTruncation ? ROOT_TRUNCATED_MESSAGE : TRUNCATED_MESSAGE}${tree}${isRootLevelTruncation ? '[TRUNCATED!]\n' : ''}${statsMessage}`
+    ? `${getTruncatedMessage(isRootLevelTruncation, options.maxItems)}${tree}${isRootLevelTruncation ? '[TRUNCATED!]\n' : ''}${statsMessage}`
     : tree + statsMessage;
+  const outputResult = options.absolute
+    ? result.map((entry) => absolutizeResultPath(entry, fullFilePath))
+    : result;
 
   return {
     path: fullFilePath,
-    includeClutter,
+    all: options.all,
+    options: describeOptions(options),
     truncated: listResult.truncated,
     isRootLevelTruncation,
     crawlHitLimit: listResult.crawlHitLimit,
-    result,
+    result: outputResult,
     statistics: displayedStats,
     fullStatistics: listResult.fullStats,
     rendered,
@@ -609,12 +647,21 @@ export function inspectDirectory({ path, includeClutter = false, abortSignal } =
 /**
  * Parse command-line arguments for the standalone CLI.
  * @param {string[]} argv Process argument vector without node and script.
- * @returns {{path: string | undefined, includeClutter: boolean, json: boolean, help: boolean, version: boolean}} Parsed options.
+ * @returns {{paths: string[], all: boolean, json: boolean, help: boolean, version: boolean, maxDepth: number, maxItems: number, maxCrawl: number, showFiles: boolean, showDirectories: boolean, showSizes: boolean, showLines: boolean, showDates: boolean, absolute: boolean}} Parsed options.
  */
 export function parseArgs(argv) {
   const parsed = {
-    path: undefined,
-    includeClutter: false,
+    paths: [],
+    all: false,
+    maxDepth: Infinity,
+    maxItems: DEFAULT_MAX_ITEMS,
+    maxCrawl: DEFAULT_MAX_CRAWL,
+    showFiles: true,
+    showDirectories: true,
+    showSizes: true,
+    showLines: true,
+    showDates: true,
+    absolute: false,
     json: false,
     help: false,
     version: false,
@@ -626,10 +673,7 @@ export function parseArgs(argv) {
     // Support a conventional option terminator so paths beginning with dashes remain usable.
     if (arg === '--') {
       const rest = argv.slice(index + 1);
-      if (rest.length > 1) {
-        throw new CliError(`Unexpected extra arguments: ${rest.slice(1).join(' ')}`, 2);
-      }
-      parsed.path = rest[0] ?? parsed.path;
+      parsed.paths.push(...rest);
       break;
     }
 
@@ -643,8 +687,8 @@ export function parseArgs(argv) {
       continue;
     }
 
-    if (arg === '-a' || arg === '--include-clutter') {
-      parsed.includeClutter = true;
+    if (arg === '-a' || arg === '--all') {
+      parsed.all = true;
       continue;
     }
 
@@ -653,15 +697,75 @@ export function parseArgs(argv) {
       continue;
     }
 
+    if (arg === '--dirs-only') {
+      parsed.showFiles = false;
+      continue;
+    }
+
+    if (arg === '--files-only') {
+      parsed.showDirectories = false;
+      continue;
+    }
+
+    if (arg === '--no-sizes') {
+      parsed.showSizes = false;
+      continue;
+    }
+
+    if (arg === '--no-lines') {
+      parsed.showLines = false;
+      continue;
+    }
+
+    if (arg === '--no-dates') {
+      parsed.showDates = false;
+      continue;
+    }
+
+    if (arg === '--absolute') {
+      parsed.absolute = true;
+      continue;
+    }
+
+    if (arg === '--max-depth') {
+      parsed.maxDepth = parseNonNegativeInteger(readOptionValue(argv, ++index, arg), arg);
+      continue;
+    }
+
+    if (arg.startsWith('--max-depth=')) {
+      parsed.maxDepth = parseNonNegativeInteger(arg.slice('--max-depth='.length), '--max-depth');
+      continue;
+    }
+
+    if (arg === '--max-items') {
+      parsed.maxItems = parsePositiveInteger(readOptionValue(argv, ++index, arg), arg);
+      continue;
+    }
+
+    if (arg.startsWith('--max-items=')) {
+      parsed.maxItems = parsePositiveInteger(arg.slice('--max-items='.length), '--max-items');
+      continue;
+    }
+
+    if (arg === '--max-crawl') {
+      parsed.maxCrawl = parsePositiveInteger(readOptionValue(argv, ++index, arg), arg);
+      continue;
+    }
+
+    if (arg.startsWith('--max-crawl=')) {
+      parsed.maxCrawl = parsePositiveInteger(arg.slice('--max-crawl='.length), '--max-crawl');
+      continue;
+    }
+
     if (arg.startsWith('-')) {
       throw new CliError(`Unknown option: ${arg}`, 2);
     }
 
-    if (parsed.path !== undefined) {
-      throw new CliError(`Unexpected extra argument: ${arg}`, 2);
-    }
+    parsed.paths.push(arg);
+  }
 
-    parsed.path = arg;
+  if (!parsed.showFiles && !parsed.showDirectories) {
+    throw new CliError('--dirs-only and --files-only cannot be used together.', 2);
   }
 
   return parsed;
@@ -687,23 +791,141 @@ export function runCli(argv, io = { stdout: process.stdout, stderr: process.stde
       return 0;
     }
 
-    const output = inspectDirectory({
-      path: options.path,
-      includeClutter: options.includeClutter,
-    });
+    if (options.paths.length === 0) {
+      io.stderr.write('xls: Missing required path argument.\n\n');
+      io.stderr.write(HELP_TEXT);
+      return 2;
+    }
+
+    const outputs = options.paths.map((path) => inspectDirectory({
+      ...options,
+      path,
+    }));
 
     if (options.json) {
-      io.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
+      io.stdout.write(`${JSON.stringify(outputs.length === 1 ? outputs[0] : outputs, null, 2)}\n`);
       return 0;
     }
 
-    io.stdout.write(`${output.rendered}\n`);
+    io.stdout.write(`${outputs.map((output) => output.rendered).join('\n\n')}\n`);
     return 0;
   } catch (error) {
     const exitCode = error instanceof CliError ? error.exitCode : 1;
     io.stderr.write(`xls: ${error.message}\n`);
     return exitCode;
   }
+}
+
+/**
+ * Normalize partial caller options into the complete listing policy.
+ * @param {object} options Partial listing options.
+ * @returns {object} Complete listing policy.
+ */
+function normalizeOptions(options = {}) {
+  return {
+    ...DEFAULT_OPTIONS,
+    ...options,
+    maxDepth: options.maxDepth ?? DEFAULT_OPTIONS.maxDepth,
+    maxItems: options.maxItems ?? DEFAULT_OPTIONS.maxItems,
+    maxCrawl: options.maxCrawl ?? DEFAULT_OPTIONS.maxCrawl,
+  };
+}
+
+/**
+ * Return a JSON-friendly snapshot of the effective CLI options.
+ * @param {object} options Complete listing policy.
+ * @returns {object} Serializable option values.
+ */
+function describeOptions(options) {
+  return {
+    all: options.all,
+    maxDepth: Number.isFinite(options.maxDepth) ? options.maxDepth : null,
+    maxItems: options.maxItems,
+    maxCrawl: options.maxCrawl,
+    showFiles: options.showFiles,
+    showDirectories: options.showDirectories,
+    showSizes: options.showSizes,
+    showLines: options.showLines,
+    showDates: options.showDates,
+    absolute: options.absolute,
+  };
+}
+
+/**
+ * Read the value following an option that requires an argument.
+ * @param {string[]} argv Argument vector.
+ * @param {number} index Index where the value should appear.
+ * @param {string} option Option name used in error messages.
+ * @returns {string} Option value.
+ */
+function readOptionValue(argv, index, option) {
+  const value = argv[index];
+  if (value === undefined || value.startsWith('-')) {
+    throw new CliError(`${option} requires a value.`, 2);
+  }
+
+  return value;
+}
+
+/**
+ * Parse a positive integer CLI option.
+ * @param {string} value Raw option value.
+ * @param {string} option Option name used in error messages.
+ * @returns {number} Parsed integer.
+ */
+function parsePositiveInteger(value, option) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new CliError(`${option} must be a positive integer.`, 2);
+  }
+
+  return parsed;
+}
+
+/**
+ * Parse a non-negative integer CLI option.
+ * @param {string} value Raw option value.
+ * @param {string} option Option name used in error messages.
+ * @returns {number} Parsed integer.
+ */
+function parseNonNegativeInteger(value, option) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new CliError(`${option} must be a non-negative integer.`, 2);
+  }
+
+  return parsed;
+}
+
+/**
+ * Build the truncation explanation for the active display limit.
+ * @param {boolean} isRootLevelTruncation Whether root entries alone exceeded the display limit.
+ * @param {number} maxItems Display item limit.
+ * @returns {string} User-facing truncation message.
+ */
+function getTruncatedMessage(isRootLevelTruncation, maxItems) {
+  if (isRootLevelTruncation) {
+    return `This directory has more than ${maxItems} root-level entries, which exceeds the display limit. Showing only the first ${maxItems} root-level entries below. Use xls on specific subdirectories or raise --max-items to explore more.\n\n`;
+  }
+
+  return `This directory contains more than ${maxItems} entries when explored recursively. ALL root-level entries are shown below, but subdirectories are not fully explored. Use xls on specific subdirectories, raise --max-items, or set --max-depth to control the output.\n\n`;
+}
+
+/**
+ * Return a result entry whose path is absolute for structured output.
+ * @param {object} entry Relative result entry.
+ * @param {string} rootPath Absolute listed root.
+ * @returns {object} Result entry with an absolute path.
+ */
+function absolutizeResultPath(entry, rootPath) {
+  const hasDirectorySuffix = entry.path.endsWith(sep);
+  const relativePath = hasDirectorySuffix ? entry.path.slice(0, -1) : entry.path;
+  const absolutePath = join(rootPath, relativePath);
+
+  return {
+    ...entry,
+    path: hasDirectorySuffix ? `${absolutePath}${sep}` : absolutePath,
+  };
 }
 
 /**
@@ -727,20 +949,28 @@ class CliError extends Error {
  * @param {object} fullStats Mutable aggregate statistics.
  * @param {string} basePath Root path used for relative display paths.
  * @param {string} childPath Directory path to record.
+ * @param {object} options Listing policy and output controls.
+ * @param {number} pathDepth Precomputed path depth from the listed root.
+ * @param {boolean} canShow Whether this entry is within the requested display depth.
  * @param {Function} onTruncated Callback invoked once the display limit is exceeded.
  */
-function recordDirectory(results, fullStats, basePath, childPath, onTruncated) {
+function recordDirectory(results, fullStats, basePath, childPath, options, pathDepth, canShow, onTruncated) {
   fullStats.totalItems++;
   fullStats.dirCount++;
 
-  const pathDepth = depthFromBase(basePath, childPath);
   fullStats.maxDepth = Math.max(fullStats.maxDepth, pathDepth);
 
   let modificationTime = null;
-  try {
-    modificationTime = lstatSync(childPath).mtime;
-  } catch {
-    // Missing stat data should not hide the directory itself.
+  if (options.showDates) {
+    try {
+      modificationTime = lstatSync(childPath).mtime;
+    } catch {
+      // Missing stat data should not hide the directory itself.
+    }
+  }
+
+  if (!canShow || !options.showDirectories) {
+    return;
   }
 
   pushResult(results, {
@@ -754,7 +984,7 @@ function recordDirectory(results, fullStats, basePath, childPath, onTruncated) {
     fileSize: null,
     lineCount: null,
     modificationTime,
-  }, onTruncated);
+  }, options, onTruncated);
 }
 
 /**
@@ -763,20 +993,27 @@ function recordDirectory(results, fullStats, basePath, childPath, onTruncated) {
  * @param {object} fullStats Mutable aggregate statistics.
  * @param {string} basePath Root path used for relative display paths.
  * @param {string} childPath Directory path to record.
+ * @param {object} options Listing policy and output controls.
+ * @param {number} pathDepth Precomputed path depth from the listed root.
  * @param {Function} onTruncated Callback invoked once the display limit is exceeded.
  */
-function recordSkippedDirectory(results, fullStats, basePath, childPath, onTruncated) {
+function recordSkippedDirectory(results, fullStats, basePath, childPath, options, pathDepth, onTruncated) {
   fullStats.totalItems++;
   fullStats.skippedCount++;
 
-  const pathDepth = depthFromBase(basePath, childPath);
   fullStats.maxDepth = Math.max(fullStats.maxDepth, pathDepth);
 
   let modificationTime = null;
-  try {
-    modificationTime = lstatSync(childPath).mtime;
-  } catch {
-    // Skipped directories can still be represented without timestamp metadata.
+  if (options.showDates) {
+    try {
+      modificationTime = lstatSync(childPath).mtime;
+    } catch {
+      // Skipped directories can still be represented without timestamp metadata.
+    }
+  }
+
+  if (pathDepth > options.maxDepth || !options.showDirectories) {
+    return;
   }
 
   pushResult(results, {
@@ -790,7 +1027,7 @@ function recordSkippedDirectory(results, fullStats, basePath, childPath, onTrunc
     fileSize: null,
     lineCount: null,
     modificationTime,
-  }, onTruncated);
+  }, options, onTruncated);
 }
 
 /**
@@ -800,9 +1037,10 @@ function recordSkippedDirectory(results, fullStats, basePath, childPath, onTrunc
  * @param {string} basePath Root path used for relative display paths.
  * @param {string} path Directory path that failed.
  * @param {Error & {code?: string}} error Read error.
+ * @param {object} options Listing policy and output controls.
  * @param {Function} onTruncated Callback invoked once the display limit is exceeded.
  */
-function recordDirectoryError(results, fullStats, basePath, path, error, onTruncated) {
+function recordDirectoryError(results, fullStats, basePath, path, error, options, onTruncated) {
   const errorPath = relative(basePath, path);
   fullStats.totalItems++;
   fullStats.errorCount++;
@@ -815,6 +1053,10 @@ function recordDirectoryError(results, fullStats, basePath, path, error, onTrunc
   if (existingEntry) {
     existingEntry.isError = true;
     existingEntry.errorMessage = error.code || error.message;
+    return;
+  }
+
+  if (pathDepth > options.maxDepth || !options.showDirectories) {
     return;
   }
 
@@ -831,7 +1073,7 @@ function recordDirectoryError(results, fullStats, basePath, path, error, onTrunc
     fileSize: null,
     lineCount: null,
     modificationTime: null,
-  }, onTruncated);
+  }, options, onTruncated);
 }
 
 /**
@@ -840,9 +1082,12 @@ function recordDirectoryError(results, fullStats, basePath, path, error, onTrunc
  * @param {object} fullStats Mutable aggregate statistics.
  * @param {string} basePath Root path used for relative display paths.
  * @param {string} childPath File path to record.
+ * @param {object} options Listing policy and output controls.
+ * @param {number} pathDepth Precomputed path depth from the listed root.
+ * @param {boolean} canShow Whether this entry is within the requested display depth.
  * @param {Function} onTruncated Callback invoked once the display limit is exceeded.
  */
-function recordFile(results, fullStats, basePath, childPath, onTruncated) {
+function recordFile(results, fullStats, basePath, childPath, options, pathDepth, canShow, onTruncated) {
   let isSymlink = false;
   let symlinkTarget = null;
   let isDirectory = false;
@@ -855,27 +1100,29 @@ function recordFile(results, fullStats, basePath, childPath, onTruncated) {
     // Use lstat first so symlink metadata and raw targets are preserved.
     const lstat = lstatSync(childPath);
     isSymlink = lstat.isSymbolicLink();
-    fileSize = lstat.size;
+    fileSize = options.showSizes ? lstat.size : null;
 
     if (isSymlink) {
       try {
         symlinkTarget = readlinkSync(childPath);
-        try {
-          modificationTime = statSync(childPath).mtime;
-        } catch {
-          modificationTime = lstat.mtime;
+        if (options.showDates) {
+          try {
+            modificationTime = statSync(childPath).mtime;
+          } catch {
+            modificationTime = lstat.mtime;
+          }
         }
       } catch {
         symlinkTarget = '?';
-        modificationTime = lstat.mtime;
+        modificationTime = options.showDates ? lstat.mtime : null;
       }
     } else {
       isDirectory = lstat.isDirectory();
-      modificationTime = lstat.mtime;
+      modificationTime = options.showDates ? lstat.mtime : null;
 
       if (!isDirectory) {
         isExecutable = Boolean(lstat.mode & 0o111);
-        if (isTextFile(childPath)) {
+        if (options.showLines && isTextFile(childPath)) {
           lineCount = countFileLines(childPath);
         }
       }
@@ -891,8 +1138,11 @@ function recordFile(results, fullStats, basePath, childPath, onTruncated) {
     fullStats.fileCount++;
   }
 
-  const pathDepth = depthFromBase(basePath, childPath);
   fullStats.maxDepth = Math.max(fullStats.maxDepth, pathDepth);
+
+  if (!canShow || !options.showFiles) {
+    return;
+  }
 
   pushResult(results, {
     path: relative(basePath, childPath),
@@ -905,17 +1155,18 @@ function recordFile(results, fullStats, basePath, childPath, onTruncated) {
     fileSize,
     lineCount,
     modificationTime,
-  }, onTruncated);
+  }, options, onTruncated);
 }
 
 /**
  * Append a display result while enforcing the visible output cap.
  * @param {object[]} results Mutable result list.
  * @param {object} entry Entry to append.
+ * @param {object} options Listing policy and output controls.
  * @param {Function} onTruncated Callback invoked once the display limit is exceeded.
  */
-function pushResult(results, entry, onTruncated) {
-  if (results.length < MAX_FILES) {
+function pushResult(results, entry, options, onTruncated) {
+  if (results.length < options.maxItems) {
     results.push(entry);
     return;
   }
