@@ -6,7 +6,7 @@ summaries without the visual noise of common project clutter.
 
 By default, `xls` shows directories first, files after, symlinks as stored,
 executable files marked with `*asterisks*`, file sizes, text line counts,
-modification dates, skipped clutter, and summary statistics.
+modification dates, hidden clutter summaries, and summary statistics.
 
 ## Installation
 
@@ -46,7 +46,7 @@ Options:
 | `-a`, `--all` | Include hidden and clutter directories such as `.git` and `node_modules`. |
 | `--max-depth <n>` | Limit traversal to `n` path levels below each root. |
 | `--max-items <n>` | Limit displayed entries per root. Default: `500`. |
-| `--max-crawl <n>` | Limit examined entries per root. Default: `1000`. |
+| `--max-crawl <n>` | Limit examined entries per root and per hidden summary scan. Default: `1000`. |
 | `--dirs-only` | Show directories only. |
 | `--files-only` | Show files only, with parent folders kept for context. |
 | `--no-sizes` | Hide file sizes. |
@@ -62,7 +62,9 @@ Options:
 `xls` hides common noisy directories by default, including hidden paths,
 `node_modules`, `.git`, build outputs, coverage directories, Python virtual
 environments, cache directories, and similar generated folders. Hidden and
-clutter directories are still shown as `[SKIPPED]` so their presence is visible.
+clutter directories are still shown as `[HIDDEN]` with bounded subtree totals so
+their presence and rough size are visible. Traversal and display-limit omissions
+are shown separately as `[SKIPPED]`.
 
 Use `--all` when you really want to traverse everything.
 

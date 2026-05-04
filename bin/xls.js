@@ -36,7 +36,7 @@ Options:
   -a, --all               Include hidden and clutter directories such as .git and node_modules
       --max-depth <n>     Limit traversal to n path levels below each root
       --max-items <n>     Limit displayed entries per root (default: 500)
-      --max-crawl <n>     Limit examined entries per root (default: 1000)
+      --max-crawl <n>     Limit examined entries per root and per hidden summary scan (default: 1000)
       --dirs-only         Show directories only
       --files-only        Show files only, with parent folders kept for context
       --no-sizes          Hide file sizes
@@ -119,12 +119,12 @@ export function resolvePath(path) {
 }
 
 /**
- * Decide whether a path should be displayed as present but intentionally not traversed.
+ * Decide whether a path should be displayed as present but hidden from traversal.
  * @param {string} path Absolute or relative filesystem path.
  * @param {boolean} all Whether hidden and clutter paths should be traversed normally.
- * @returns {boolean} True when the entry should be marked `[SKIPPED]`.
+ * @returns {boolean} True when the entry should be marked `[HIDDEN]`.
  */
-export function shouldShowAsSkipped(path, all = false) {
+export function shouldHideFromTraversal(path, all = false) {
   if (all) {
     return false;
   }
@@ -161,6 +161,16 @@ export function shouldShowAsSkipped(path, all = false) {
 }
 
 /**
+ * Backward-compatible alias for the old noise-suppression predicate name.
+ * @param {string} path Absolute or relative filesystem path.
+ * @param {boolean} all Whether hidden and clutter paths should be traversed normally.
+ * @returns {boolean} True when the entry should be marked `[HIDDEN]`.
+ */
+export function shouldShowAsSkipped(path, all = false) {
+  return shouldHideFromTraversal(path, all);
+}
+
+/**
  * Decide whether a path should be omitted entirely from traversal.
  * @param {string} path Absolute or relative filesystem path.
  * @param {boolean} all Whether hidden and clutter paths should be traversed normally.
@@ -193,6 +203,7 @@ export function listDirectory(initialPath, basePath, options = DEFAULT_OPTIONS, 
     fileCount: 0,
     dirCount: 0,
     errorCount: 0,
+    hiddenCount: 0,
     skippedCount: 0,
     maxDepth: 0,
   };
@@ -225,7 +236,7 @@ export function listDirectory(initialPath, basePath, options = DEFAULT_OPTIONS, 
       continue;
     }
 
-    if (path !== initialPath && shouldShowAsSkipped(path, options.all)) {
+    if (path !== initialPath && shouldHideFromTraversal(path, options.all)) {
       continue;
     }
 
@@ -261,9 +272,9 @@ export function listDirectory(initialPath, basePath, options = DEFAULT_OPTIONS, 
       const canShowChild = childDepth <= options.maxDepth;
 
       if (child.isDirectory()) {
-        // Show noisy directories as known-but-unexplored unless the caller asks for clutter.
-        if (shouldShowAsSkipped(childPath, options.all)) {
-          recordSkippedDirectory(results, fullStats, basePath, childPath, options, childDepth, () => {
+        // Show noisy directories as known-but-hidden unless the caller asks for clutter.
+        if (shouldHideFromTraversal(childPath, options.all)) {
+          recordHiddenDirectory(results, fullStats, basePath, childPath, options, childDepth, () => {
             truncated = true;
           });
           continue;
@@ -310,12 +321,14 @@ export function createFileTree(resultObjects) {
     const symlinkTarget = typeof resultObj === 'string' ? null : resultObj.symlinkTarget;
     const isDirectory = typeof resultObj === 'string' ? path.endsWith(sep) : resultObj.isDirectory;
     const isExecutable = typeof resultObj === 'string' ? false : resultObj.isExecutable;
+    const isHidden = typeof resultObj === 'string' ? false : resultObj.isHidden;
     const isSkipped = typeof resultObj === 'string' ? false : resultObj.isSkipped;
     const isError = typeof resultObj === 'string' ? false : resultObj.isError;
     const errorMessage = typeof resultObj === 'string' ? null : resultObj.errorMessage;
     const fileSize = typeof resultObj === 'string' ? null : resultObj.fileSize;
     const lineCount = typeof resultObj === 'string' ? null : resultObj.lineCount;
     const modificationTime = typeof resultObj === 'string' ? null : resultObj.modificationTime;
+    const hiddenSummary = typeof resultObj === 'string' ? null : resultObj.hiddenSummary;
 
     // Walk path components, creating missing ancestors as directory nodes.
     const parts = path.split(sep).filter((part) => part !== '');
@@ -332,9 +345,11 @@ export function createFileTree(resultObjects) {
         // Merge final metadata into an ancestor placeholder created by an earlier child path.
         if (isLastPart) {
           existingNode.isSkipped = isSkipped;
+          existingNode.isHidden = isHidden;
           existingNode.isError = isError;
           existingNode.errorMessage = errorMessage;
           existingNode.modificationTime = modificationTime;
+          existingNode.hiddenSummary = hiddenSummary;
         }
         currentLevel = existingNode.children || [];
         continue;
@@ -347,12 +362,14 @@ export function createFileTree(resultObjects) {
         isSymlink: isLastPart ? isSymlink : false,
         symlinkTarget: isLastPart ? symlinkTarget : null,
         isExecutable: isLastPart ? isExecutable : false,
+        isHidden: isLastPart ? isHidden : false,
         isSkipped: isLastPart ? isSkipped : false,
         isError: isLastPart ? isError : false,
         errorMessage: isLastPart ? errorMessage : null,
         fileSize: isLastPart ? fileSize : null,
         lineCount: isLastPart ? lineCount : null,
         modificationTime: isLastPart ? modificationTime : null,
+        hiddenSummary: isLastPart ? hiddenSummary : null,
       };
 
       if (!isLastPart || isDirectory) {
@@ -385,7 +402,9 @@ function renderNodeDisplay(node, options) {
     displayName += sep;
   }
 
-  if (node.isSkipped) {
+  if (node.isHidden) {
+    displayName += ' [HIDDEN]';
+  } else if (node.isSkipped) {
     displayName += ' [SKIPPED]';
   } else if (node.isError && node.errorMessage) {
     displayName += ` [ERROR: ${node.errorMessage}]`;
@@ -395,7 +414,9 @@ function renderNodeDisplay(node, options) {
 
   // Compact file metadata attached only when the entry was actually inspected.
   let fileSizeInfo = '';
-  if (!node.isSkipped && !node.isError && node.type === 'file' && node.fileSize !== null) {
+  if (node.isHidden && node.hiddenSummary) {
+    fileSizeInfo = formatHiddenSummary(node.hiddenSummary, options);
+  } else if (!node.isSkipped && !node.isError && node.type === 'file' && node.fileSize !== null) {
     const sizeStr = formatFileSize(node.fileSize);
     fileSizeInfo = node.lineCount !== null
       ? `\t(${sizeStr} / ${node.lineCount} lines)`
@@ -404,16 +425,18 @@ function renderNodeDisplay(node, options) {
 
   // Raw symlink target so users see the link exactly as stored.
   let symlinkInfo = '';
-  if (!node.isSkipped && !node.isError && node.isSymlink && node.symlinkTarget) {
+  if (!node.isHidden && !node.isSkipped && !node.isError && node.isSymlink && node.symlinkTarget) {
     symlinkInfo = ` -> ${node.symlinkTarget}`;
-  } else if (!node.isSkipped && !node.isError && node.isSymlink) {
+  } else if (!node.isHidden && !node.isSkipped && !node.isError && node.isSymlink) {
     symlinkInfo = ' -> ';
   }
 
   // Timestamps visually aligned for quick scanning in terminal output.
   let modificationDateInfo = '';
-  if (!node.isSkipped && !node.isError && node.modificationTime) {
-    const formattedDate = formatModificationDate(node.modificationTime);
+  const summaryTime = node.isHidden ? node.hiddenSummary?.latestModificationTime : null;
+  const displayedTime = summaryTime || node.modificationTime;
+  if (options.showDates && !node.isSkipped && !node.isError && displayedTime) {
+    const formattedDate = formatModificationDate(displayedTime);
     if (formattedDate) {
       modificationDateInfo = node.type === 'directory'
         ? `\t\t${formattedDate}`
@@ -457,12 +480,14 @@ export function printTree(tree, level = 0, prefix = '', rootPath = '', options =
       isSymlink: false,
       symlinkTarget: null,
       isExecutable: false,
+      isHidden: false,
       isSkipped: false,
       isError: false,
       errorMessage: null,
       fileSize: null,
       lineCount: null,
       modificationTime: rootModTime,
+      hiddenSummary: null,
     };
     const rd = renderNodeDisplay(rootNode, options);
     result += `${rd.displayName}${rd.fileSizeInfo}${rd.symlinkInfo}${rd.modificationDateInfo}\n`;
@@ -478,7 +503,7 @@ export function printTree(tree, level = 0, prefix = '', rootPath = '', options =
     result += `${prefix}${treeSymbol}${rd.displayName}${rd.fileSizeInfo}${rd.symlinkInfo}${rd.modificationDateInfo}\n`;
 
     // Recurse only into nodes that were traversed successfully.
-    if (!node.isSkipped && !node.isError && node.children?.length > 0) {
+    if (!node.isHidden && !node.isSkipped && !node.isError && node.children?.length > 0) {
       const childPrefix = prefix + (isLast ? '    ' : '│   ');
       result += printTree(node.children, level + 1, childPrefix, rootPath, options);
     }
@@ -539,6 +564,27 @@ export function formatFileSize(bytes) {
 }
 
 /**
+ * Format hidden-subtree aggregate metadata for the tree renderer.
+ * @param {{fileCount: number, dirCount: number, totalBytes: number|null, incomplete: boolean}} summary Hidden subtree summary.
+ * @param {object} options Rendering controls.
+ * @returns {string} Tab-prefixed compact summary metadata.
+ */
+function formatHiddenSummary(summary, options) {
+  const prefix = summary.incomplete ? '>' : '';
+  const parts = [];
+
+  // Size visibility follows --no-sizes, while counts are the core hidden-subtree signal.
+  if (options.showSizes) {
+    parts.push(`${prefix}${formatFileSize(summary.totalBytes)}`);
+  }
+
+  parts.push(`${prefix}${summary.fileCount} files`);
+  parts.push(`${prefix}${summary.dirCount} dirs`);
+
+  return `\t(${parts.join(' / ')})`;
+}
+
+/**
  * Format modification date in `[YYYY/MM/DD - HH:MM:SS]` local-time format.
  * @param {Date|number|string} modificationTime Modification time accepted by Date.
  * @returns {string} Formatted date, or an empty string if invalid.
@@ -588,13 +634,14 @@ export function countFileLines(filePath) {
 /**
  * Calculate statistics from listing results for validation and display.
  * @param {Array<object|string>} resultObjects Flat listing result objects.
- * @returns {{totalItems: number, fileCount: number, dirCount: number, errorCount: number, skippedCount: number, maxDepth: number, accessibleItems: number}} Summary counts.
+ * @returns {{totalItems: number, fileCount: number, dirCount: number, errorCount: number, hiddenCount: number, skippedCount: number, maxDepth: number, accessibleItems: number}} Summary counts.
  */
 export function calculateStatistics(resultObjects) {
   let totalItems = 0;
   let fileCount = 0;
   let dirCount = 0;
   let errorCount = 0;
+  let hiddenCount = 0;
   let skippedCount = 0;
   let maxDepth = 0;
 
@@ -604,11 +651,14 @@ export function calculateStatistics(resultObjects) {
     // Keep support for the original string-result shape while emitting object results in the CLI.
     const isDirectory = typeof resultObj === 'string' ? resultObj.endsWith(sep) : resultObj.isDirectory;
     const isError = typeof resultObj === 'string' ? false : resultObj.isError;
+    const isHidden = typeof resultObj === 'string' ? false : resultObj.isHidden;
     const isSkipped = typeof resultObj === 'string' ? false : resultObj.isSkipped;
     const path = typeof resultObj === 'string' ? resultObj : resultObj.path;
 
     if (isError) {
       errorCount++;
+    } else if (isHidden) {
+      hiddenCount++;
     } else if (isSkipped) {
       skippedCount++;
     } else if (isDirectory) {
@@ -626,9 +676,10 @@ export function calculateStatistics(resultObjects) {
     fileCount,
     dirCount,
     errorCount,
+    hiddenCount,
     skippedCount,
     maxDepth,
-    accessibleItems: totalItems - errorCount - skippedCount,
+    accessibleItems: totalItems - errorCount - hiddenCount - skippedCount,
   };
 }
 
@@ -659,7 +710,7 @@ export function inspectDirectory({ path, abortSignal, ...rawOptions } = {}) {
     isRootLevelTruncation = rootLevelItems.length === options.maxItems;
     if (!isRootLevelTruncation) {
       for (const item of rootLevelItems) {
-        if (item.isDirectory) {
+        if (item.isDirectory && !item.isHidden) {
           item.isSkipped = true;
         }
       }
@@ -673,9 +724,9 @@ export function inspectDirectory({ path, abortSignal, ...rawOptions } = {}) {
 
   if (listResult.truncated) {
     const foundStats = listResult.fullStats;
-    statsMessage = `\nCrawled: ${foundStats.totalItems} total items (${foundStats.fileCount} files, ${foundStats.dirCount} directories, ${foundStats.errorCount} errors, ${foundStats.skippedCount} skipped) | Max depth: ${foundStats.maxDepth}\nDisplayed: ${displayedStats.totalItems} total items (${displayedStats.fileCount} files, ${displayedStats.dirCount} directories, ${displayedStats.errorCount} errors, ${displayedStats.skippedCount} skipped) | Max depth: ${displayedStats.maxDepth}`;
+    statsMessage = `\nCrawled: ${foundStats.totalItems} total items (${foundStats.fileCount} files, ${foundStats.dirCount} directories, ${foundStats.errorCount} errors, ${foundStats.hiddenCount} hidden, ${foundStats.skippedCount} skipped) | Max depth: ${foundStats.maxDepth}\nDisplayed: ${displayedStats.totalItems} total items (${displayedStats.fileCount} files, ${displayedStats.dirCount} directories, ${displayedStats.errorCount} errors, ${displayedStats.hiddenCount} hidden, ${displayedStats.skippedCount} skipped) | Max depth: ${displayedStats.maxDepth}`;
   } else {
-    statsMessage = `\nStatistics: ${displayedStats.totalItems} total items (${displayedStats.fileCount} files, ${displayedStats.dirCount} directories, ${displayedStats.errorCount} errors, ${displayedStats.skippedCount} skipped) | Max depth: ${displayedStats.maxDepth} | Accessible: ${displayedStats.accessibleItems}`;
+    statsMessage = `\nStatistics: ${displayedStats.totalItems} total items (${displayedStats.fileCount} files, ${displayedStats.dirCount} directories, ${displayedStats.errorCount} errors, ${displayedStats.hiddenCount} hidden, ${displayedStats.skippedCount} skipped) | Max depth: ${displayedStats.maxDepth} | Accessible: ${displayedStats.accessibleItems}`;
   }
 
   const limitWarning = getLimitWarning(listResult, isRootLevelTruncation, options);
@@ -1032,6 +1083,77 @@ class CliError extends Error {
 }
 
 /**
+ * Summarize a hidden subtree without adding its descendants to the display tree.
+ * @param {string} rootPath Hidden directory path.
+ * @param {number} maxCrawl Maximum descendants to examine for this hidden root.
+ * @returns {{fileCount: number, dirCount: number, totalBytes: number|null, latestModificationTime: Date|null, incomplete: boolean}} Aggregate hidden-subtree metadata.
+ */
+function summarizeHiddenDirectory(rootPath, maxCrawl) {
+  const summary = {
+    fileCount: 0,
+    dirCount: 0,
+    totalBytes: 0,
+    latestModificationTime: null,
+    incomplete: false,
+  };
+  let examined = 0;
+  const queue = [rootPath];
+
+  try {
+    // Include the hidden root's own modification time without counting it as a descendant.
+    summary.latestModificationTime = lstatSync(rootPath).mtime;
+  } catch {
+    return summary;
+  }
+
+  while (queue.length > 0) {
+    const directoryPath = queue.shift();
+    let children;
+
+    try {
+      children = readdirSync(directoryPath, { withFileTypes: true });
+    } catch {
+      // Permission or race failures stop this branch without inventing descendants.
+      continue;
+    }
+
+    for (const child of children) {
+      if (examined >= maxCrawl) {
+        summary.incomplete = true;
+        return summary;
+      }
+
+      const childPath = join(directoryPath, child.name);
+      examined++;
+
+      let childStats;
+      try {
+        childStats = lstatSync(childPath);
+      } catch {
+        // A vanished or unreadable entry was examined, but it contributes no fake values.
+        continue;
+      }
+
+      if (!summary.latestModificationTime || childStats.mtime > summary.latestModificationTime) {
+        summary.latestModificationTime = childStats.mtime;
+      }
+
+      // Symlinked directories stay file-like so hidden summaries never escape the subtree.
+      if (childStats.isDirectory() && !childStats.isSymbolicLink()) {
+        summary.dirCount++;
+        queue.push(childPath);
+        continue;
+      }
+
+      summary.fileCount++;
+      summary.totalBytes += childStats.size;
+    }
+  }
+
+  return summary;
+}
+
+/**
  * Record a traversable directory in result and aggregate statistics.
  * @param {object[]} results Mutable display result list.
  * @param {object} fullStats Mutable aggregate statistics.
@@ -1067,16 +1189,19 @@ function recordDirectory(results, fullStats, basePath, childPath, options, pathD
     symlinkTarget: null,
     isDirectory: true,
     isExecutable: false,
+    isHidden: false,
     isSkipped: pathDepth >= options.maxDepth,
+    isError: false,
     depth: pathDepth,
     fileSize: null,
     lineCount: null,
     modificationTime,
+    hiddenSummary: null,
   }, options, onTruncated);
 }
 
 /**
- * Record a skipped directory in result and aggregate statistics.
+ * Record a hidden directory in result and aggregate statistics.
  * @param {object[]} results Mutable display result list.
  * @param {object} fullStats Mutable aggregate statistics.
  * @param {string} basePath Root path used for relative display paths.
@@ -1085,36 +1210,46 @@ function recordDirectory(results, fullStats, basePath, childPath, options, pathD
  * @param {number} pathDepth Precomputed path depth from the listed root.
  * @param {Function} onTruncated Callback invoked once the display limit is exceeded.
  */
-function recordSkippedDirectory(results, fullStats, basePath, childPath, options, pathDepth, onTruncated) {
+function recordHiddenDirectory(results, fullStats, basePath, childPath, options, pathDepth, onTruncated) {
   fullStats.totalItems++;
-  fullStats.skippedCount++;
+  fullStats.hiddenCount++;
 
   fullStats.maxDepth = Math.max(fullStats.maxDepth, pathDepth);
 
-  let modificationTime = null;
-  if (options.showDates) {
-    try {
-      modificationTime = lstatSync(childPath).mtime;
-    } catch {
-      // Skipped directories can still be represented without timestamp metadata.
-    }
-  }
-
+  // Avoid paying for a hidden subtree summary when this hidden entry cannot be rendered.
   if (pathDepth > options.maxDepth || !options.showDirectories) {
     return;
   }
 
+  const entryPath = `${relative(basePath, childPath)}${sep}`;
+  if (results.length >= options.maxItems) {
+    markVisibleAncestorAsSkipped(results, entryPath);
+    onTruncated();
+    return;
+  }
+
+  const hiddenSummary = summarizeHiddenDirectory(childPath, options.maxCrawl);
+  if (!options.showSizes) {
+    hiddenSummary.totalBytes = null;
+  }
+  if (!options.showDates) {
+    hiddenSummary.latestModificationTime = null;
+  }
+
   pushResult(results, {
-    path: `${relative(basePath, childPath)}${sep}`,
+    path: entryPath,
     isSymlink: false,
     symlinkTarget: null,
     isDirectory: true,
     isExecutable: false,
-    isSkipped: true,
+    isHidden: true,
+    isSkipped: false,
+    isError: false,
     depth: pathDepth,
     fileSize: null,
     lineCount: null,
-    modificationTime,
+    modificationTime: hiddenSummary.latestModificationTime,
+    hiddenSummary,
   }, options, onTruncated);
 }
 
@@ -1154,6 +1289,7 @@ function recordDirectoryError(results, fullStats, basePath, path, error, options
     symlinkTarget: null,
     isDirectory: true,
     isExecutable: false,
+    isHidden: false,
     isSkipped: false,
     isError: true,
     errorMessage: error.code || error.message,
@@ -1161,6 +1297,7 @@ function recordDirectoryError(results, fullStats, basePath, path, error, options
     fileSize: null,
     lineCount: null,
     modificationTime: null,
+    hiddenSummary: null,
   }, options, onTruncated);
 }
 
@@ -1238,11 +1375,14 @@ function recordFile(results, fullStats, basePath, childPath, options, pathDepth,
     symlinkTarget,
     isDirectory,
     isExecutable,
+    isHidden: false,
     isSkipped: false,
+    isError: false,
     depth: pathDepth,
     fileSize,
     lineCount,
     modificationTime,
+    hiddenSummary: null,
   }, options, onTruncated);
 }
 
@@ -1275,7 +1415,7 @@ function markVisibleAncestorAsSkipped(results, omittedPath) {
 
   for (let i = parts.length - 1; i > 0; i--) {
     const ancestorPath = `${parts.slice(0, i).join(sep)}${sep}`;
-    const ancestor = results.find((entry) => entry.path === ancestorPath && entry.isDirectory);
+    const ancestor = results.find((entry) => entry.path === ancestorPath && entry.isDirectory && !entry.isHidden);
     if (ancestor) {
       ancestor.isSkipped = true;
       return;
@@ -1296,7 +1436,7 @@ function markDisplayedDirectoryAsSkipped(results, basePath, directoryPath) {
   }
 
   const entryPath = `${relativePath}${sep}`;
-  const entry = results.find((result) => result.path === entryPath && result.isDirectory);
+  const entry = results.find((result) => result.path === entryPath && result.isDirectory && !result.isHidden);
   if (entry) {
     entry.isSkipped = true;
   }
