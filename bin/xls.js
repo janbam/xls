@@ -419,7 +419,7 @@ function renderNodeDisplay(node, options) {
   } else if (!node.isSkipped && !node.isError && node.type === 'file' && node.fileSize !== null) {
     const sizeStr = formatFileSize(node.fileSize);
     fileSizeInfo = node.lineCount !== null
-      ? `\t(${sizeStr} / ${node.lineCount} lines)`
+      ? `\t(${sizeStr}, ${node.lineCount}L)`
       : `\t(${sizeStr})`;
   }
 
@@ -463,7 +463,7 @@ export function printTree(tree, level = 0, prefix = '', rootPath = '', options =
     result += `Showing contents of: ${rootPath}\n`;
     if (options.showDates) {
       const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-      result += `Modification dates shown in [YYYY/MM/DD - HH:MM:SS] format (${timeZone} timezone)\n`;
+      result += `Modification dates shown in YYYY-MM-DD HH:MM:SS format (${timeZone} timezone)\n`;
     }
     result += '\n';
 
@@ -585,7 +585,7 @@ function formatHiddenSummary(summary, options) {
 }
 
 /**
- * Format modification date in `[YYYY/MM/DD - HH:MM:SS]` local-time format.
+ * Format modification date in `YYYY-MM-DD HH:MM:SS` local-time format.
  * @param {Date|number|string} modificationTime Modification time accepted by Date.
  * @returns {string} Formatted date, or an empty string if invalid.
  */
@@ -604,7 +604,7 @@ export function formatModificationDate(modificationTime) {
     const minutes = String(date.getMinutes()).padStart(2, '0');
     const seconds = String(date.getSeconds()).padStart(2, '0');
 
-    return `[${year}/${month}/${day} - ${hours}:${minutes}:${seconds}]`;
+    return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
   } catch {
     return '';
   }
