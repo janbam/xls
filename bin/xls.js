@@ -42,11 +42,56 @@ Options:
       --no-sizes          Hide file sizes
       --no-lines          Skip text line counts
       --no-dates          Hide modification dates
-      --absolute          Use absolute entry paths in JSON output
-      --json              Print structured JSON instead of the rendered tree
+      --absolute          Compatibility flag; cannot be combined with --json
+      --json              Print one xls/1 JSON document for exactly one root path
+      --show-json-schema  Print the xls/1 JSON output schema
   -h, --help              Show this help text
       --version           Show the version
 `;
+
+const JSON_OUTPUT_SCHEMA = Object.freeze({
+  $schema: 'https://json-schema.org/draft/2020-12/schema',
+  $id: 'xls/1',
+  title: 'xls JSON output',
+  type: 'object',
+  additionalProperties: false,
+  required: ['schema', 'root', 'generated', 'entries', 'stats'],
+  properties: {
+    schema: { const: 'xls/1' },
+    root: { type: 'string' },
+    generated: { type: 'string', format: 'date-time' },
+    entries: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'type'],
+        properties: {
+          path: { type: 'string' },
+          type: { enum: ['file', 'dir'] },
+          lines: { type: 'integer', minimum: 0 },
+          bytes: { type: 'integer', minimum: 0 },
+          mtime: { type: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}$' },
+          summarized: { const: true },
+          files: { type: 'integer', minimum: 0 },
+          dirs: { type: 'integer', minimum: 0 },
+          error: { type: 'string' },
+        },
+      },
+    },
+    stats: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['files', 'dirs', 'hidden', 'maxDepth'],
+      properties: {
+        files: { type: 'integer', minimum: 0 },
+        dirs: { type: 'integer', minimum: 0 },
+        hidden: { type: 'integer', minimum: 0 },
+        maxDepth: { type: 'integer', minimum: 0 },
+      },
+    },
+  },
+});
 
 const textExtensions = new Map([
   ['txt', true], ['text', true], ['md', true], ['markdown', true],
@@ -611,6 +656,41 @@ export function formatModificationDate(modificationTime) {
 }
 
 /**
+ * Format modification time as the date-only local value used by the JSON contract.
+ * @param {Date|number|string} modificationTime Modification time accepted by Date.
+ * @returns {string|undefined} Local `YYYY-MM-DD` date, or undefined when invalid.
+ */
+export function formatJsonModificationDate(modificationTime) {
+  if (modificationTime === null || modificationTime === undefined) {
+    return undefined;
+  }
+
+  const formatted = formatModificationDate(modificationTime);
+  return formatted ? formatted.slice(0, 10) : undefined;
+}
+
+/**
+ * Format the current local timestamp with an ISO-8601 numeric timezone offset.
+ * @param {Date} date Timestamp to format.
+ * @returns {string} Local timestamp such as `2026-07-03T12:00:00+02:00`.
+ */
+export function formatGeneratedTimestamp(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  const hours = String(date.getHours()).padStart(2, '0');
+  const minutes = String(date.getMinutes()).padStart(2, '0');
+  const seconds = String(date.getSeconds()).padStart(2, '0');
+  const offsetMinutes = -date.getTimezoneOffset();
+  const offsetSign = offsetMinutes >= 0 ? '+' : '-';
+  const absoluteOffset = Math.abs(offsetMinutes);
+  const offsetHours = String(Math.floor(absoluteOffset / 60)).padStart(2, '0');
+  const offsetRemainder = String(absoluteOffset % 60).padStart(2, '0');
+
+  return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}${offsetSign}${offsetHours}:${offsetRemainder}`;
+}
+
+/**
  * Count lines in a text file.
  * @param {string} filePath Path to the file.
  * @returns {number|null} Number of lines, or null when the file cannot be read as text.
@@ -752,9 +832,117 @@ export function inspectDirectory({ path, abortSignal, ...rawOptions } = {}) {
 }
 
 /**
+ * Build the versioned machine-readable contract from an existing directory inspection.
+ * @param {object} inspection Output returned by inspectDirectory.
+ * @param {Date} generatedAt Timestamp used for the top-level generated field.
+ * @returns {{schema: string, root: string, generated: string, entries: object[], stats: object}} xls/1 JSON payload.
+ */
+export function buildJsonOutput(inspection, generatedAt = new Date()) {
+  const entries = inspection.result
+    .map((entry) => toJsonEntry(entry))
+    .sort((left, right) => compareCodepoint(left.path, right.path));
+
+  return {
+    schema: 'xls/1',
+    root: inspection.path,
+    generated: formatGeneratedTimestamp(generatedAt),
+    entries,
+    stats: {
+      files: inspection.statistics.fileCount,
+      dirs: inspection.statistics.dirCount,
+      hidden: inspection.statistics.hiddenCount,
+      maxDepth: inspection.statistics.maxDepth,
+    },
+  };
+}
+
+/**
+ * Return the JSON Schema document for the xls/1 output contract.
+ * @returns {object} JSON Schema for --json output.
+ */
+export function getJsonOutputSchema() {
+  return JSON_OUTPUT_SCHEMA;
+}
+
+/**
+ * Convert one existing scanner entry to the constrained xls/1 entry shape.
+ * @param {object} entry Internal flat listing result.
+ * @returns {object} JSON entry with only schema-approved keys.
+ */
+function toJsonEntry(entry) {
+  const output = {
+    path: normalizeJsonEntryPath(entry.path),
+    type: entry.isDirectory ? 'dir' : 'file',
+  };
+
+  // Preserve collapsed-directory semantics without exposing the hidden internal flags.
+  if (entry.isHidden && entry.hiddenSummary) {
+    output.summarized = true;
+    output.files = entry.hiddenSummary.fileCount;
+    output.dirs = entry.hiddenSummary.dirCount;
+    if (entry.hiddenSummary.totalBytes !== null) {
+      output.bytes = entry.hiddenSummary.totalBytes;
+    }
+  } else if (!entry.isDirectory && entry.fileSize !== null) {
+    output.bytes = entry.fileSize;
+  }
+
+  // Emit optional metadata only when the existing scanner actually collected it.
+  if (!entry.isDirectory && entry.lineCount !== null && entry.lineCount !== undefined) {
+    output.lines = entry.lineCount;
+  }
+
+  const mtime = formatJsonModificationDate(entry.modificationTime);
+  if (mtime) {
+    output.mtime = mtime;
+  }
+
+  // Keep the diagnostic slot reserved for the human renderer's actual error marker.
+  if (entry.isError && entry.errorMessage) {
+    output.error = entry.errorMessage;
+  } else if (entry.isSkipped) {
+    output.error = 'skipped';
+  } else if (entry.isHidden && entry.hiddenSummary?.incomplete) {
+    output.error = 'incomplete';
+  }
+
+  return output;
+}
+
+/**
+ * Normalize internal display paths to POSIX-style relative JSON paths.
+ * @param {string} entryPath Internal result path.
+ * @returns {string} Relative path without a leading `./` or trailing directory slash.
+ */
+function normalizeJsonEntryPath(entryPath) {
+  const withoutTrailingSlash = entryPath.endsWith(sep) ? entryPath.slice(0, -1) : entryPath;
+  const withoutDotPrefix = withoutTrailingSlash.startsWith(`.${sep}`)
+    ? withoutTrailingSlash.slice(2)
+    : withoutTrailingSlash;
+
+  return withoutDotPrefix.split(sep).filter((part) => part !== '').join('/');
+}
+
+/**
+ * Compare paths with plain JavaScript codepoint order, independent of locale.
+ * @param {string} left Left path.
+ * @param {string} right Right path.
+ * @returns {number} Sort comparator result.
+ */
+function compareCodepoint(left, right) {
+  if (left < right) {
+    return -1;
+  }
+  if (left > right) {
+    return 1;
+  }
+  return 0;
+}
+
+/**
  * Parse command-line arguments for the standalone CLI.
  * @param {string[]} argv Process argument vector without node and script.
- * @returns {{paths: string[], all: boolean, json: boolean, help: boolean, version: boolean, maxDepth: number, maxItems: number, maxCrawl: number, showFiles: boolean, showDirectories: boolean, showSizes: boolean, showLines: boolean, showDates: boolean, absolute: boolean}} Parsed options.
+ * @returns {{paths: string[], all: boolean, json: boolean, showJsonSchema: boolean, help: boolean, version: boolean, maxDepth: number, maxItems: number, maxCrawl: number, showFiles: boolean, showDirectories: boolean, showSizes: boolean, showLines: boolean, showDates: boolean, absolute: boolean}} Parsed options.
  */
 export function parseArgs(argv) {
   const parsed = {
@@ -770,6 +958,7 @@ export function parseArgs(argv) {
     showDates: true,
     absolute: false,
     json: false,
+    showJsonSchema: false,
     help: false,
     version: false,
   };
@@ -801,6 +990,11 @@ export function parseArgs(argv) {
 
     if (arg === '--json') {
       parsed.json = true;
+      continue;
+    }
+
+    if (arg === '--show-json-schema') {
+      parsed.showJsonSchema = true;
       continue;
     }
 
@@ -888,6 +1082,11 @@ export function runCli(argv, io = { stdout: process.stdout, stderr: process.stde
   try {
     const options = parseArgs(argv);
 
+    if (options.showJsonSchema) {
+      io.stdout.write(`${JSON.stringify(getJsonOutputSchema(), null, 2)}\n`);
+      return 0;
+    }
+
     if (options.help) {
       io.stdout.write(HELP_TEXT);
       return 0;
@@ -904,13 +1103,27 @@ export function runCli(argv, io = { stdout: process.stdout, stderr: process.stde
       return 2;
     }
 
+    if (options.json && options.paths.length !== 1) {
+      throw new CliError('--json requires exactly one path because schema xls/1 has one root.', 2);
+    }
+
+    if (options.json && options.absolute) {
+      throw new CliError('--absolute cannot be combined with --json because schema xls/1 requires relative entry paths.', 2);
+    }
+
     const outputs = options.paths.map((path) => inspectDirectory({
       ...options,
       path,
     }));
 
     if (options.json) {
-      io.stdout.write(`${JSON.stringify(outputs.length === 1 ? outputs[0] : outputs, null, 2)}\n`);
+      if (outputs[0].crawlHitLimit) {
+        throw new CliError('--json cannot represent crawl-limit omissions; raise --max-crawl or inspect a narrower path.', 1);
+      }
+      if (outputs[0].truncated) {
+        throw new CliError('--json cannot represent display-limit omissions; raise --max-items or inspect a narrower path.', 1);
+      }
+      io.stdout.write(`${JSON.stringify(buildJsonOutput(outputs[0]), null, 2)}\n`);
       return 0;
     }
 

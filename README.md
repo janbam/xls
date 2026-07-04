@@ -36,7 +36,8 @@ xls .
 xls --max-depth 2 src test
 xls --all --max-items 1000 .
 xls --files-only --no-dates .
-xls --json --absolute .
+xls --json .
+xls --show-json-schema
 ```
 
 Options:
@@ -52,8 +53,9 @@ Options:
 | `--no-sizes` | Hide file sizes. |
 | `--no-lines` | Skip text line counts. |
 | `--no-dates` | Hide modification dates. |
-| `--absolute` | Use absolute entry paths in JSON output. |
-| `--json` | Print structured JSON instead of the rendered tree. |
+| `--absolute` | Compatibility flag; cannot be combined with `--json`. |
+| `--json` | Print one `xls/1` JSON document instead of the rendered tree. |
+| `--show-json-schema` | Print the `xls/1` JSON output schema. |
 | `-h`, `--help` | Show help. |
 | `--version` | Show the version. |
 

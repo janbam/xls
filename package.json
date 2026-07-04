@@ -7,7 +7,8 @@
     "xls": "./bin/xls.js"
   },
   "scripts": {
-    "check": "node --check bin/xls.js"
+    "check": "node --check bin/xls.js",
+    "test": "node --test"
   },
   "license": "MIT"
 }
