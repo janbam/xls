@@ -42,8 +42,9 @@ Options:
       --no-sizes          Hide file sizes
       --no-lines          Skip text line counts
       --no-dates          Hide modification dates
-      --absolute          Compatibility flag; cannot be combined with --json
+      --absolute          Compatibility flag; cannot be combined with --json or --tree-only
       --json              Print one xls/1 JSON document for exactly one root path
+      --tree-only         Print only the relative descendant tree for exactly one root path
       --show-json-schema  Print the xls/1 JSON output schema
   -h, --help              Show this help text
       --version           Show the version
@@ -942,7 +943,7 @@ function compareCodepoint(left, right) {
 /**
  * Parse command-line arguments for the standalone CLI.
  * @param {string[]} argv Process argument vector without node and script.
- * @returns {{paths: string[], all: boolean, json: boolean, showJsonSchema: boolean, help: boolean, version: boolean, maxDepth: number, maxItems: number, maxCrawl: number, showFiles: boolean, showDirectories: boolean, showSizes: boolean, showLines: boolean, showDates: boolean, absolute: boolean}} Parsed options.
+ * @returns {{paths: string[], all: boolean, json: boolean, treeOnly: boolean, showJsonSchema: boolean, help: boolean, version: boolean, maxDepth: number, maxItems: number, maxCrawl: number, showFiles: boolean, showDirectories: boolean, showSizes: boolean, showLines: boolean, showDates: boolean, absolute: boolean}} Parsed options.
  */
 export function parseArgs(argv) {
   const parsed = {
@@ -958,6 +959,7 @@ export function parseArgs(argv) {
     showDates: true,
     absolute: false,
     json: false,
+    treeOnly: false,
     showJsonSchema: false,
     help: false,
     version: false,
@@ -990,6 +992,11 @@ export function parseArgs(argv) {
 
     if (arg === '--json') {
       parsed.json = true;
+      continue;
+    }
+
+    if (arg === '--tree-only') {
+      parsed.treeOnly = true;
       continue;
     }
 
@@ -1097,6 +1104,19 @@ export function runCli(argv, io = { stdout: process.stdout, stderr: process.stde
       return 0;
     }
 
+    // Reject ambiguous tree-only requests before touching the filesystem or stdout.
+    if (options.treeOnly && options.json) {
+      throw new CliError('--tree-only cannot be combined with --json.', 2);
+    }
+
+    if (options.treeOnly && options.absolute) {
+      throw new CliError('--tree-only cannot be combined with --absolute because tree-only names are relative.', 2);
+    }
+
+    if (options.treeOnly && options.paths.length !== 1) {
+      throw new CliError('--tree-only requires exactly one path.', 2);
+    }
+
     if (options.paths.length === 0) {
       io.stderr.write('xls: Missing required path argument.\n\n');
       io.stderr.write(HELP_TEXT);
@@ -1116,14 +1136,19 @@ export function runCli(argv, io = { stdout: process.stdout, stderr: process.stde
       path,
     }));
 
+    // Embeddable modes must validate the whole inspection before emitting any bytes.
+    if (options.json || options.treeOnly) {
+      assertCompleteListing(outputs[0], options.json ? '--json' : '--tree-only');
+    }
+
     if (options.json) {
-      if (outputs[0].crawlHitLimit) {
-        throw new CliError('--json cannot represent crawl-limit omissions; raise --max-crawl or inspect a narrower path.', 1);
-      }
-      if (outputs[0].truncated) {
-        throw new CliError('--json cannot represent display-limit omissions; raise --max-items or inspect a narrower path.', 1);
-      }
       io.stdout.write(`${JSON.stringify(buildJsonOutput(outputs[0]), null, 2)}\n`);
+      return 0;
+    }
+
+    if (options.treeOnly) {
+      // Enter the existing renderer below its report wrapper so tree semantics stay identical.
+      io.stdout.write(printTree(createFileTree(outputs[0].result), 1, '', outputs[0].path, options));
       return 0;
     }
 
@@ -1133,6 +1158,21 @@ export function runCli(argv, io = { stdout: process.stdout, stderr: process.stde
     const exitCode = error instanceof CliError ? error.exitCode : 1;
     io.stderr.write(`xls: ${error.message}\n`);
     return exitCode;
+  }
+}
+
+/**
+ * Require a complete inspection before rendering an embeddable output mode.
+ * @param {object} inspection Output returned by inspectDirectory.
+ * @param {string} optionName CLI option named in failure diagnostics.
+ */
+function assertCompleteListing(inspection, optionName) {
+  if (inspection.crawlHitLimit) {
+    throw new CliError(`${optionName} cannot represent crawl-limit omissions; raise --max-crawl or inspect a narrower path.`, 1);
+  }
+
+  if (inspection.truncated) {
+    throw new CliError(`${optionName} cannot represent display-limit omissions; raise --max-items or inspect a narrower path.`, 1);
   }
 }
 

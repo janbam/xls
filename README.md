@@ -37,6 +37,7 @@ xls --max-depth 2 src test
 xls --all --max-items 1000 .
 xls --files-only --no-dates .
 xls --json .
+xls --tree-only src
 xls --show-json-schema
 ```
 
@@ -53,11 +54,20 @@ Options:
 | `--no-sizes` | Hide file sizes. |
 | `--no-lines` | Skip text line counts. |
 | `--no-dates` | Hide modification dates. |
-| `--absolute` | Compatibility flag; cannot be combined with `--json`. |
+| `--absolute` | Compatibility flag; cannot be combined with `--json` or `--tree-only`. |
 | `--json` | Print one `xls/1` JSON document instead of the rendered tree. |
+| `--tree-only` | Print only the relative descendant tree for exactly one path. |
 | `--show-json-schema` | Print the `xls/1` JSON output schema. |
 | `-h`, `--help` | Show help. |
 | `--version` | Show the version. |
+
+`--tree-only` is intended for embedding an `xls` tree in another document. It
+uses the normal connectors, relative names, metadata, ordering, and
+`[HIDDEN]` / `[SKIPPED]` markers, but omits the heading, listed root, blank
+separators, statistics, and warnings. A non-empty tree ends with one newline;
+an empty directory produces no output. The mode requires exactly one path,
+cannot be combined with `--json` or `--absolute`, and fails before writing to
+stdout if `--max-items` or `--max-crawl` would omit entries.
 
 ## Defaults
 

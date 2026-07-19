@@ -307,13 +307,129 @@ test('rejects absolute JSON paths because xls/1 requires relative entry paths', 
   }
 });
 
-test('documents JSON root and absolute constraints in help output', () => {
+test('documents embeddable output constraints in help output', () => {
   const result = runXls(['--help']);
 
   assert.equal(result.code, 0);
   assert.equal(result.stderr, '');
   assert.match(result.stdout, /--json\s+Print one xls\/1 JSON document for exactly one root path/);
-  assert.match(result.stdout, /--absolute\s+Compatibility flag; cannot be combined with --json/);
+  assert.match(result.stdout, /--tree-only\s+Print only the relative descendant tree for exactly one root path/);
+  assert.match(result.stdout, /--absolute\s+Compatibility flag; cannot be combined with --json or --tree-only/);
+});
+
+test('prints only the normal descendant tree with one trailing newline', () => {
+  const root = createFixture();
+  try {
+    const result = runXls(['--tree-only', '--no-dates', root]);
+
+    assert.equal(result.code, 0);
+    assert.equal(result.stderr, '');
+    assert.equal(result.stdout, `├── node_modules/ [HIDDEN]\t(7B / 2 files / 1 dirs)
+├── src/
+│   └── a.txt\t(8B, 2L)
+└── z.bin\t(3B)
+`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('preserves nested connectors and ordering in tree-only output', () => {
+  const root = createNestedTruncationFixture();
+  try {
+    const result = runXls(['--tree-only', '--no-dates', root]);
+
+    assert.equal(result.code, 0);
+    assert.equal(result.stderr, '');
+    assert.equal(result.stdout, `├── a/
+│   ├── one.txt\t(4B, 1L)
+│   ├── three.txt\t(6B, 1L)
+│   └── two.txt\t(4B, 1L)
+└── b/
+`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('prints nothing for an empty tree-only directory', () => {
+  const root = mkdtempSync(join(tmpdir(), 'xls-empty-tree-'));
+  try {
+    const result = runXls(['--tree-only', root]);
+
+    assert.equal(result.code, 0);
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr, '');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('omits every human report wrapper while retaining hidden and skipped markers', () => {
+  const root = createFixture();
+  try {
+    const result = runXls(['--tree-only', '--no-dates', '--max-depth', '1', root]);
+
+    assert.equal(result.code, 0);
+    assert.equal(result.stderr, '');
+    assert.match(result.stdout, /node_modules\/ \[HIDDEN\]/);
+    assert.match(result.stdout, /src\/ \[SKIPPED\]/);
+    assert.doesNotMatch(result.stdout, /Showing contents of:|Modification dates shown/);
+    assert.equal(result.stdout.includes(`${basename(root)}/`), false);
+    assert.doesNotMatch(result.stdout, /Statistics:|Crawled:|Displayed:/);
+    assert.doesNotMatch(result.stdout, /🚨|TRUNCATED/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('requires exactly one path in tree-only mode', () => {
+  for (const args of [
+    ['--tree-only'],
+    ['--tree-only', '/first', '/second'],
+  ]) {
+    const result = runXls(args);
+
+    assert.equal(result.code, 2);
+    assert.equal(result.stdout, '');
+    assert.match(result.stderr, /--tree-only requires exactly one path/);
+  }
+});
+
+test('rejects incompatible tree-only output options', () => {
+  for (const option of ['--json', '--absolute']) {
+    const result = runXls(['--tree-only', option, '.']);
+
+    assert.equal(result.code, 2);
+    assert.equal(result.stdout, '');
+    assert.match(result.stderr, new RegExp(`--tree-only cannot be combined with ${option}`));
+  }
+});
+
+test('rejects tree-only output before stdout when display limits omit entries', () => {
+  const root = createNestedTruncationFixture();
+  try {
+    const result = runXls(['--tree-only', '--max-items', '4', root]);
+
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, '');
+    assert.match(result.stderr, /--tree-only cannot represent display-limit omissions/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('rejects tree-only output before stdout when crawl limits omit entries', () => {
+  const root = createFixture();
+  try {
+    const result = runXls(['--tree-only', '--max-crawl', '2', root]);
+
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, '');
+    assert.match(result.stderr, /--tree-only cannot represent crawl-limit omissions/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('keeps human-readable output unchanged when JSON mode is absent', () => {
